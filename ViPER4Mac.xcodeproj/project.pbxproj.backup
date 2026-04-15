@@ -156,6 +156,8 @@
 		7FD060652F69BA8100DA4E0E /* MainWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FD060642F69BA8100DA4E0E /* MainWindow.swift */; };
 		7FD060662F69BA8100DA4E0E /* EqGraphView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FD060632F69BA8100DA4E0E /* EqGraphView.swift */; };
 		7FD060852F6C3E3500DA4E0E /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = 7FD060842F6C3E3500DA4E0E /* Localizable.xcstrings */; };
+		B0E976702F8FA12500A14414 /* XPCService-Info.plist in Resources */ = {isa = PBXBuildFile; fileRef = B0E9766F2F8FA11D00A14414 /* XPCService-Info.plist */; };
+		B0E976722F8FA16900A14414 /* ViPERDriverXPC.cpp in Sources */ = {isa = PBXBuildFile; fileRef = B0E976712F8FA16400A14414 /* ViPERDriverXPC.cpp */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -354,6 +356,8 @@
 		7FD060632F69BA8100DA4E0E /* EqGraphView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EqGraphView.swift; sourceTree = "<group>"; };
 		7FD060642F69BA8100DA4E0E /* MainWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindow.swift; sourceTree = "<group>"; };
 		7FD060842F6C3E3500DA4E0E /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
+		B0E9766F2F8FA11D00A14414 /* XPCService-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "XPCService-Info.plist"; sourceTree = "<group>"; };
+		B0E976712F8FA16400A14414 /* ViPERDriverXPC.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = ViPERDriverXPC.cpp; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -620,6 +624,8 @@
 		7F4FBC4B2F66EAC9002A6C68 /* ViPERDriver */ = {
 			isa = PBXGroup;
 			children = (
+				B0E976712F8FA16400A14414 /* ViPERDriverXPC.cpp */,
+				B0E9766F2F8FA11D00A14414 /* XPCService-Info.plist */,
 				7F4FBC4E2F66EB84002A6C68 /* ViPERDriver.cpp */,
 				7F4FBC502F66EBB0002A6C68 /* ViPERSharedRing.h */,
 				7FD060292F66F49800DA4E0E /* Info.plist */,
@@ -921,6 +927,7 @@
 				7FD060452F68550F00DA4E0E /* Device.json in Resources */,
 				7FD060462F68550F00DA4E0E /* MuteControl.json in Resources */,
 				7FD060472F68550F00DA4E0E /* Object.json in Resources */,
+				B0E976702F8FA12500A14414 /* XPCService-Info.plist in Resources */,
 				7FD060482F68550F00DA4E0E /* Plugin.json in Resources */,
 				7FD060492F68550F00DA4E0E /* Stream.json in Resources */,
 				7FD0604A2F68550F00DA4E0E /* VolumeControl.json in Resources */,
@@ -1014,6 +1021,7 @@
 				7FD060332F66FC9F00DA4E0E /* Tracer.cpp in Sources */,
 				7FD060172F66F22D00DA4E0E /* Object.cpp in Sources */,
 				7FD060282F66F2AB00DA4E0E /* TPCircularBuffer.c in Sources */,
+				B0E976722F8FA16900A14414 /* ViPERDriverXPC.cpp in Sources */,
 				7FD060182F66F22D00DA4E0E /* Strings.cpp in Sources */,
 				7FD060192F66F22D00DA4E0E /* Uid.cpp in Sources */,
 				7FD0601A2F66F22D00DA4E0E /* Bridge.g.cpp in Sources */,

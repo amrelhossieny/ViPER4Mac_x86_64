@@ -1,0 +1,54 @@
+rebuild clean:
+
+1. full clean build
+make clean
+make build
+
+2. verify the symbol is exported
+nm -gU build/Release/ViPER4Mac.driver/Contents/MacOS/ViPER4Mac | grep Create
+# you SHOULD see: _ViPER4Mac_Create
+
+3. install properly
+sudo rm -rf /Library/Audio/Plug-Ins/HAL/ViPER4Mac.driver
+sudo cp -R build/Release/ViPER4Mac.driver /Library/Audio/Plug-Ins/HAL/
+sudo chown -R root:wheel /Library/Audio/Plug-Ins/HAL/ViPER4Mac.driver
+sudo chmod -R 755 /Library/Audio/Plug-Ins/HAL/ViPER4Mac.driver
+sudo xattr -cr /Library/Audio/Plug-Ins/HAL/ViPER4Mac.driver
+sudo codesign -f -s - --deep /Library/Audio/Plug-Ins/HAL/ViPER4Mac.driver
+
+4. make log dir writable (coreaudiod runs as root but let's be safe)
+sudo mkdir -p /Library/Logs/ViPER4Mac
+sudo chmod 777 /Library/Logs/ViPER4Mac
+
+
+5. Test it:
+
+Terminal 1:
+
+sudo log stream --predicate 'process == "coreaudiod"' --debug | grep -i viper
+
+Terminal 2:
+
+sudo killall coreaudiod
+
+We should NOW see:
+
+Attempting to load: ViPER4Mac.driver
+(no error)
+
+And within 2 seconds:
+cat /Library/Logs/ViPER4Mac/driver.log
+
+Should be like :
+ViPER4Mac_Create called
+ViPER4Mac_Create completed, device=...
+SharedRing initialized, size=131088
+
+Then check:
+system_profiler SPAudioDataType | grep -A2 ViPER
+
+Should show "ViPER4Mac"
+
+If it works, open the app:
+
+open /Applications/ViPER4Mac.app

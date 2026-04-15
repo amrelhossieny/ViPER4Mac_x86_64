@@ -1,13 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleExecutable</key>
-    <string>$(EXECUTABLE_NAME)</string>
+    <string>ViPER4Mac</string>
     <key>CFBundleIdentifier</key>
-    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <string>com.viper4mac.driver</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -15,19 +16,21 @@
     <key>CFBundlePackageType</key>
     <string>BNDL</string>
     <key>CFBundleShortVersionString</key>
-    <string>$(MARKETING_VERSION)</string>
+    <string>1.0.0</string>
     <key>CFBundleVersion</key>
-    <string>$(CURRENT_PROJECT_VERSION)</string>
+    <string>1.0</string>
     <key>CFPlugInFactories</key>
     <dict>
-        <key>A38E7C98-14BF-46E6-A49D-C307E20B08BE</key>
+        <!-- Our factory UUID (can be anything unique) -->
+        <key>A2E1C4F1-9B23-4A84-9D5D-7E1A4F6B8C9D</key>
         <string>ViPER4Mac_Create</string>
     </dict>
     <key>CFPlugInTypes</key>
     <dict>
+        <!-- THIS is kAudioServerPlugInTypeUUID - must match AirPlay exactly -->
         <key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
         <array>
-            <string>A38E7C98-14BF-46E6-A49D-C307E20B08BE</string>
+            <string>A2E1C4F1-9B23-4A84-9D5D-7E1A4F6B8C9D</string>
         </array>
     </dict>
 </dict>

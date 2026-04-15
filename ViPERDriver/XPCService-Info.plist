@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.viper4mac.driver.xpc</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>ViPER4Mac</string>
+    <key>CFBundlePackageType</key>
+    <string>XPC!</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1.0</string>
+    <key>CFBundleExecutable</key>
+    <string>ViPER4Mac</string>
+
+    <key>CFPlugInFactories</key>
+    <dict>
+        <key>A2E1C4F1-9B23-4A84-9D5D-7E1A4F6B8C9D</key>
+        <string>ViPER4Mac_Create</string>
+    </dict>
+    <key>CFPlugInTypes</key>
+    <dict>
+        <key>293CCA2B-7539-41BE-8CFD-8F6229060E3F</key>
+        <array>
+            <string>A2E1C4F1-9B23-4A84-9D5D-7E1A4F6B8C9D</string>
+        </array>
+    </dict>
+
+    <key>ServiceType</key>
+    <string>Application</string>
+    <key>XPCService</key>
+    <dict>
+        <key>ServiceType</key>
+        <string>Application</string>
+    </dict>
+</dict>
+</plist>

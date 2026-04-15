@@ -12,6 +12,17 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(__x86_64__)
+#include <pmmintrin.h>
+#include <xmmintrin.h>
+static void enableFlushToZero() {
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+}
+#else
+static void enableFlushToZero() {}
+#endif
+
 #include "TPCircularBuffer.h"
 #include "ViPERSharedRing.h"
 
@@ -93,18 +104,18 @@ public:
                 float v = src[i] < 0 ? -src[i] : src[i];
                 if (v > maxVal) maxVal = v;
             }
-            FILE *f = openDriverLog();
-            if (f) {
-                fprintf(
-                    f,
-                    "WriteMixed: count=%llu bytes=%u shm=%s max=%.6f\n",
-                    writeCount_.load(),
-                    bytesCount,
-                    sharedRing_ ? "yes" : "no",
-                    maxVal
-                );
-                fclose(f);
-            }
+            // FILE *f = openDriverLog();
+            // if (f) {
+            //     fprintf(
+            //         f,
+            //         "WriteMixed: count=%llu bytes=%u shm=%s max=%.6f\n",
+            //         writeCount_.load(),
+            //         bytesCount,
+            //         sharedRing_ ? "yes" : "no",
+            //         maxVal
+            //     );
+            //     fclose(f);
+            // }
         }
     }
 
@@ -133,43 +144,23 @@ private:
     ViPERSharedRing *sharedRing_ = nullptr;
 
     void initSharedMemory() {
-        int fd = open(VIPER_SHM_FILE, O_CREAT | O_RDWR, 0666);
+        // Use shm_open instead of /tmp file - sandbox safe
+        shm_unlink(VIPER_SHM_FILE); // clean old
+        int fd = shm_open(VIPER_SHM_FILE, O_CREAT | O_RDWR, 0666);
         if (fd < 0) {
-            FILE *f = openDriverLog();
-            if (f) {
-                fprintf(f, "open shm file failed: %d\n", errno);
-                fclose(f);
-            }
             return;
         }
-        fchmod(fd, 0666);
-        if (ftruncate(fd, VIPER_SHM_SIZE) != 0) {
-            close(fd);
-            return;
-        }
+        ftruncate(fd, VIPER_SHM_SIZE);
         void *ptr =
             mmap(nullptr, VIPER_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         close(fd);
         if (ptr == MAP_FAILED) {
-            FILE *f = openDriverLog();
-            if (f) {
-                fprintf(f, "mmap failed\n");
-                fclose(f);
-            }
             return;
         }
         sharedRing_ = static_cast<ViPERSharedRing *>(ptr);
         atomic_store_explicit(&sharedRing_->writePos, 0, memory_order_relaxed);
         atomic_store_explicit(&sharedRing_->readPos, 0, memory_order_relaxed);
         memset(sharedRing_->samples, 0, sizeof(sharedRing_->samples));
-
-        FILE *f = openDriverLog();
-        if (f) {
-            fprintf(
-                f, "SharedRing initialized, size=%lu\n", (unsigned long) VIPER_SHM_SIZE
-            );
-            fclose(f);
-        }
     }
 };
 
@@ -183,20 +174,20 @@ public:
     UInt32 GetTransportType() const override { return kAudioDeviceTransportTypeBuiltIn; }
 
     OSStatus StartIOImpl(UInt32 clientID, UInt32 startCount) override {
-        FILE *f = openDriverLog();
-        if (f) {
-            fprintf(f, "StartIO: clientID=%u startCount=%u\n", clientID, startCount);
-            fclose(f);
-        }
+        // FILE *f = openDriverLog();
+        // if (f) {
+        //     fprintf(f, "StartIO: clientID=%u startCount=%u\n", clientID, startCount);
+        //     fclose(f);
+        // }
         return aspl::Device::StartIOImpl(clientID, startCount);
     }
 
     OSStatus StopIOImpl(UInt32 clientID, UInt32 startCount) override {
-        FILE *f = openDriverLog();
-        if (f) {
-            fprintf(f, "StopIO: clientID=%u startCount=%u\n", clientID, startCount);
-            fclose(f);
-        }
+        // FILE *f = openDriverLog();
+        // if (f) {
+        //     fprintf(f, "StopIO: clientID=%u startCount=%u\n", clientID, startCount);
+        //     fclose(f);
+        // }
         return aspl::Device::StopIOImpl(clientID, startCount);
     }
 
@@ -221,11 +212,11 @@ static std::shared_ptr<aspl::Driver> s_driver;
 
 extern "C" void *ViPER4Mac_Create(CFAllocatorRef allocator, CFUUIDRef typeUUID) {
     (void) allocator;
-    FILE *f = openDriverLog();
-    if (f) {
-        fprintf(f, "ViPER4Mac_Create called\n");
-        fclose(f);
-    }
+   // FILE *f = openDriverLog();
+    // if (f) {
+    //     fprintf(f, "ViPER4Mac_Create called\n");
+    //     fclose(f);
+    // }
 
     if (!CFEqual(typeUUID, kAudioServerPlugInTypeUUID)) {
         return nullptr;
@@ -278,17 +269,17 @@ extern "C" void *ViPER4Mac_Create(CFAllocatorRef allocator, CFUUIDRef typeUUID) 
 
     s_driver = std::make_shared<aspl::Driver>(context, plugin);
 
-    FILE *f2 = openDriverLog();
-    if (f2) {
-        fprintf(f2, "ViPER4Mac_Create completed, device=%u\n", device->GetID());
-        fprintf(
-            f2,
-            "  inputStreams=%u outputStreams=%u\n",
-            device->GetStreamCount(aspl::Direction::Input),
-            device->GetStreamCount(aspl::Direction::Output)
-        );
-        fclose(f2);
-    }
+    // FILE *f2 = openDriverLog();
+    // if (f2) {
+    //     fprintf(f2, "ViPER4Mac_Create completed, device=%u\n", device->GetID());
+    //     fprintf(
+    //         f2,
+    //         "  inputStreams=%u outputStreams=%u\n",
+    //         device->GetStreamCount(aspl::Direction::Input),
+    //         device->GetStreamCount(aspl::Direction::Output)
+    //     );
+    //     fclose(f2);
+    // }
 
     return s_driver->GetReference();
 }

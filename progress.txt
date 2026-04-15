@@ -1,0 +1,247 @@
+# Updated Progress Report
+
+## What We Started With
+A macOS audio DSP app showing "Driver Not Found" and "Status: Not Active".
+
+---
+
+## Session Timeline & What We Fixed
+
+### ❌ Problem 1 — Wrong Plugin Type UUID
+**Root cause:** `Info.plist` had `293CCA2B-7539-41BE-8CFD-8F6229060E3F` instead of the correct `kAudioServerPlugInTypeUUID`.
+
+**Fix:** Changed to `443ABAB8-E7B3-491A-B985-BEB9187030DB` (discovered by comparing with AirPlay.driver).
+
+---
+
+### ❌ Problem 2 — XPC Mode vs Bundle Mode Confusion
+**Root cause:** Adding `AudioServerPlugIn_XPCServiceName` key forced XPC mode, but our XPC service didn't implement the correct protocol. Removing it caused the driver to be ignored entirely.
+
+**Fix:** Removed the XPC key entirely. Driver now loads **in-process** like AirPlay — `dlopen` directly into coreaudiod.
+
+---
+
+### ❌ Problem 3 — Architecture Mismatch (arm64 cached in x86_64 build)
+**Root cause:** A leftover arm64 XPC binary from architecture experiments got embedded into the driver bundle.
+
+**Fix:** Full `make clean` + proper arch flags everywhere.
+
+---
+
+### ❌ Problem 4 — Xcode Overwrites Info.plist
+**Root cause:** Xcode's `builtin-infoPlistUtility` replaces our custom plist during build, stripping `CFPlugInFactories`, `CFPlugInTypes` and adding wrong keys.
+
+**Fix:** Added `fix-plist` step in Makefile using Python3 to patch the plist after Xcode builds it, then re-sign.
+
+---
+
+## Current State
+
+### What Works ✅
+```
+Driver loads:     _coreaudiod  65487  Core Audio Driver (ViPER4Mac.driver) ✅
+Device activates: HALS_Device::Activate: activating device 62: ViPER4Mac_VirtualDevice ✅
+Default output:   FindPreferredDefaultDevice: 'dOut' ViPER4Mac_VirtualDevice ✅
+System output:    FindPreferredDefaultDevice: 'sOut' ViPER4Mac_VirtualDevice ✅
+App sees driver:  Driver version 1.0.0 shown in UI ✅
+system_profiler:  ViPER4Mac: Default Output Device: Yes ✅
+```
+
+### What Doesn't Work ❌
+```
+Streaming:  Inactive
+Audio:      No sound output
+SHM:        /com.viper4mac.shm not found — driver may not be creating it
+App status: "Streaming: Inactive"
+```
+
+---
+
+## Current Architecture (Working Parts)
+
+```
+coreaudiod
+    └── dlopen → ViPER4Mac.driver (bundle, x86_64) ✅
+            └── ViPER4Mac_Create() called ✅
+                    └── aspl::Device "ViPER4Mac_VirtualDevice" registered ✅
+                            └── Set as Default Output ✅
+
+ViPER4Mac.app (running) ✅
+    └── AudioEngine.swift
+            └── Looks for virtual device ✅ (found)
+            └── mapSharedMemory() ← shm_open fails ❌
+            └── setupInputIOProc() ← never runs ❌
+            └── AudioOutputUnitStart() ← never runs ❌
+            └── Status: Streaming Inactive ❌
+```
+
+---
+
+## Root Cause of Remaining Issue
+
+### Problem A — Shared Memory Not Created
+The driver's `initSharedMemory()` runs inside `ViPERIOHandler` constructor:
+```cpp
+// ViPERDriver.cpp
+ViPERIOHandler() {
+    TPCircularBufferInit(&ringBuffer_, ...);
+    initSharedMemory();  // ← creates /com.viper4mac.shm
+}
+```
+
+But `ViPERIOHandler` is created inside `ViPER4Mac_Create()` which runs as `_coreaudiod` user. The SHM should be created — but the app can't find it. Likely a **permissions or timing issue**.
+
+### Problem B — AudioEngine Never Starts
+Looking at `AudioEngine.start()`:
+```swift
+// AudioEngine.swift
+func start() {
+    // Waits up to 10 seconds for virtual device
+    var viperDevice = findViPERDevice()  // ← this should now work ✅
+
+    // Gets real output device
+    guard let realDevice = findRealOutputDevice()  // ← needs checking
+
+    // Maps shared memory
+    mapSharedMemory()  // ← shm_open("/com.viper4mac.shm") fails ❌
+
+    // Sets up IOProc
+    setupInputIOProc()
+
+    // Sets up output AUHAL
+    setupOutputUnit()
+
+    // Sets ViPER as default output
+    setDefaultOutputDevice(inputDeviceID)
+}
+```
+
+The engine may be failing at `mapSharedMemory()` and bailing out silently.
+
+---
+
+## Next Steps (In Priority Order)
+
+### Step 1 — Enable Driver Logging
+Uncomment the logging in `ViPERDriver.cpp` to confirm `ViPER4Mac_Create` runs and SHM is initialized:
+
+```cpp
+// In ViPER4Mac_Create:
+FILE *f = openDriverLog();
+if (f) {
+    fprintf(f, "ViPER4Mac_Create called\n");
+    fclose(f);
+}
+
+// In initSharedMemory:
+FILE *f = openDriverLog();
+if (f) {
+    fprintf(f, "SHM init: fd=%d ptr=%p\n", fd, ptr);
+    fclose(f);
+}
+```
+
+### Step 2 — Check App Engine Start Logs
+Add temporary logging to `AudioEngine.start()` to see exactly where it fails:
+```swift
+logger.info("findViPERDevice: \(viperDevice)")
+logger.info("mapSharedMemory result: \(sharedRingPtr != nil)")
+logger.info("setupInputIOProc result: \(setupInputIOProc())")
+```
+
+### Step 3 — Fix SHM Permissions
+The driver runs as `_coreaudiod`, app runs as user `eren`. The SHM may have wrong permissions:
+```cpp
+// In initSharedMemory() - make world readable/writable
+int fd = shm_open(VIPER_SHM_FILE, O_CREAT | O_RDWR, 0666);
+fchmod(fd, 0666);  // ← add this explicitly
+```
+
+### Step 4 — Fix findRealOutputDevice()
+With ViPER now set as default output, `findRealOutputDevice()` may return `nil` because:
+```swift
+private func findRealOutputDevice() -> AudioDeviceID? {
+    let currentDefault = getDefaultOutputDevice()
+    // currentDefault IS ViPER now — so this returns nil!
+    if getDeviceUID(currentDefault) != viperUID ...
+}
+```
+
+The engine needs to find the **real speakers** before it sets ViPER as default.
+
+### Step 5 — Fix Engine Start Order
+```swift
+// Current (wrong on first run):
+// 1. Find ViPER device ✅
+// 2. Get default output → returns ViPER (wrong!) ❌
+// 3. Map SHM
+// 4. Start IOProc
+
+// Fixed order:
+// 1. Find ViPER device
+// 2. Save current default BEFORE installing ViPER
+// 3. Find real output from saved default
+// 4. Map SHM
+// 5. Start IOProc
+// 6. Set ViPER as default
+```
+
+---
+
+## Key Log Evidence (Latest Session)
+
+```
+# Driver loading perfectly now:
+HALS_RemotePlugInRegistrar.mm:421  Creating remote driver service: ViPER4Mac.driver, pid: 65487
+HALS_Device::Activate: activating device 62: ViPER4Mac_VirtualDevice
+Registering factory A2E1C4F1-9B23-4A84-9D5D-7E1A4F6B8C9D ViPER4Mac_Create
+FindPreferredDefaultDevice: 'dOut' found preferred[0] 62: ViPER4Mac_VirtualDevice
+
+# App running but audio engine not starting:
+_coreaudiod  65487  Core Audio Driver (ViPER4Mac.driver)  ← driver process alive
+ViPER4Mac    65287  /Applications/ViPER4Mac.app           ← app running
+# But: no IOProc callbacks, no SHM, no audio flow
+```
+
+---
+
+## Build Pipeline (Current — Working)
+
+```
+make clean && make build && make install
+    ├── xcodebuild ViPER4Mac.app          (Swift UI + AudioEngine)
+    ├── xcodebuild ViPERDSP               (C++ DSP library)  
+    ├── xcodebuild ViPERDriver            (HAL bundle)
+    ├── fix-plist                         (patch UUIDs via python3)
+    └── resign                            (codesign the bundle)
+
+Install:
+    ├── cp driver → /Library/Audio/Plug-Ins/HAL/
+    ├── cp app    → /Applications/
+    ├── chown/chmod/xattr
+    ├── codesign
+    └── killall coreaudiod
+```
+
+---
+
+## Files Modified This Session
+
+| File | Change |
+|------|--------|
+| `ViPERDriver/Info.plist` | Fixed Plugin Type UUID to `443ABAB8` |
+| `Makefile` | Removed XPC, added fix-plist + resign |
+| `ViPERDriver/ViPERDriverMain.cpp` | Created (not needed anymore, can remove) |
+| `ViPERDriver/XPCService-Info.plist` | Created (not needed anymore, can remove) |
+
+---
+
+## What To Do Next Session
+
+1. **Enable driver logging** → confirm SHM creation
+2. **Fix `findRealOutputDevice()`** → must find speakers before ViPER becomes default
+3. **Fix SHM permissions** → `fchmod(fd, 0666)` after `shm_open`
+4. **Test audio flow** → play audio, verify IOProc callbacks fire
+5. **Fix volume sync** → volume control between virtual and real device
+6. **Test DSP chain** → verify ViPER effects are applied
+7. **UI polish** → EQ display, profile management
