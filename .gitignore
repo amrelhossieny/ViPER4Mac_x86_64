@@ -4,3 +4,5 @@ build/
 DerivedData/
 /tmp/
 .DS_Store
+progress.txt
+terminal_orders.txt
