@@ -1,3 +1,5 @@
+//ViPER4Mac/Model/ViPERState.swift
+
 import Combine
 import CoreAudio
 import Foundation

@@ -1,3 +1,5 @@
+//ViPER4Mac/App/AppDelegate.swift
+
 import AppKit
 import SwiftUI
 

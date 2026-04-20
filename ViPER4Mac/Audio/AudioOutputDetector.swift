@@ -1,3 +1,4 @@
+//ViPER4Mac/Audio/AudioOutputDetector.swift
 import CoreAudio
 import Foundation
 

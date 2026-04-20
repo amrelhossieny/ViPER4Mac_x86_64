@@ -1,10 +1,12 @@
+// ViPERSharedRing.h
 #ifndef VIPER_SHARED_RING_H
 #define VIPER_SHARED_RING_H
 
 #include <stdatomic.h>
 #include <stdint.h>
 
-#define VIPER_SHM_FILE "/com.viper4mac.shm"   // add the leading /
+// CONSISTENCY FIX: Use /tmp path for both C++ and Swift open()
+#define VIPER_SHM_PATH "/tmp/viper4mac_ring.bin" 
 #define VIPER_SHM_RING_FRAMES 16384
 #define VIPER_SHM_CHANNELS 2
 #define VIPER_SHM_RING_SAMPLES (VIPER_SHM_RING_FRAMES * VIPER_SHM_CHANNELS)

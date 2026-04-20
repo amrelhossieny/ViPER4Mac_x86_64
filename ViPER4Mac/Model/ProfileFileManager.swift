@@ -1,3 +1,5 @@
+//ViPER4Mac/Model/ProfileFileManager.swift
+
 import Foundation
 
 private let logger = AppLogger(category: "ProfileFileManager")

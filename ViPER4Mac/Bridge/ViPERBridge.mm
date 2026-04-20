@@ -16,11 +16,13 @@
 }
 
 - (void)processAudio:(float *)buffer frameCount:(uint32_t)frameCount {
-  std::vector<float> vec(buffer, buffer + frameCount * 2);
+  // CRITICAL: No std::vector here! No allocations allowed in RT thread!
   os_unfair_lock_lock(&_lock);
-  _engine.process(vec, frameCount);
+  
+  // Directly pass the pointer to the C++ engine
+  _engine.process(buffer, frameCount);
+  
   os_unfair_lock_unlock(&_lock);
-  memcpy(buffer, vec.data(), frameCount * 2 * sizeof(float));
 }
 
 - (void)setParameter:(int)param

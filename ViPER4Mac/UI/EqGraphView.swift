@@ -1,3 +1,5 @@
+//ViPER4Mac/UI/EqGraphView.swift
+
 import AppKit
 import SwiftUI
 

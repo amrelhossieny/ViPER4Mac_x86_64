@@ -1,3 +1,4 @@
+//ViPER4Mac/Model/FileLogger.swift
 import Foundation
 
 final class FileLogger {

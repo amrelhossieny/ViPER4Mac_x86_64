@@ -1,247 +1,349 @@
-# Updated Progress Report
-
-## What We Started With
-A macOS audio DSP app showing "Driver Not Found" and "Status: Not Active".
+# ViPER4Mac — Progress Report
+Last updated: 2026-04-20
 
 ---
 
-## Session Timeline & What We Fixed
-
-### ❌ Problem 1 — Wrong Plugin Type UUID
-**Root cause:** `Info.plist` had `293CCA2B-7539-41BE-8CFD-8F6229060E3F` instead of the correct `kAudioServerPlugInTypeUUID`.
-
-**Fix:** Changed to `443ABAB8-E7B3-491A-B985-BEB9187030DB` (discovered by comparing with AirPlay.driver).
+## Where We Started
+macOS audio DSP app showing "Driver Not Found" / "Status: Not Active". No audio flow at all.
 
 ---
 
-### ❌ Problem 2 — XPC Mode vs Bundle Mode Confusion
-**Root cause:** Adding `AudioServerPlugIn_XPCServiceName` key forced XPC mode, but our XPC service didn't implement the correct protocol. Removing it caused the driver to be ignored entirely.
+## All Fixes Applied So Far ✅
 
-**Fix:** Removed the XPC key entirely. Driver now loads **in-process** like AirPlay — `dlopen` directly into coreaudiod.
+### Fix 1 — Wrong Plugin Type UUID
+Info.plist had the wrong CFPlugInTypes UUID. Fixed to `443ABAB8-E7B3-491A-B985-BEB9187030DB`
+(discovered by diffing against AirPlay.driver).
+
+### Fix 2 — XPC vs In-Process Mode
+Removed `AudioServerPlugIn_XPCServiceName` key. Driver now loads in-process via dlopen,
+same as AirPlay.driver. No XPC service needed.
+
+### Fix 3 — Architecture Mismatch
+Leftover arm64 XPC binary was embedded in an x86_64 build. Fixed by full `make clean`
+and correct arch flags throughout.
+
+### Fix 4 — Xcode Overwrites Info.plist
+Xcode's builtin-infoPlistUtility was replacing our custom plist on every build,
+stripping CFPlugInFactories and CFPlugInTypes. Fixed by adding a `fix-plist` Makefile
+step (Python3) that re-patches the plist after Xcode builds it, then re-codesigns.
+
+### Fix 5 — Shared Memory Permissions
+Driver (runs as _coreaudiod) was creating /tmp/viper4mac_ring.bin with restrictive
+permissions that the user app couldn't write to. Fixed by adding fchmod(fd, 0666)
+after open() in initSharedMemory(). Verified with ls -la showing -rw-rw-rw-.
+
+### Fix 6 — Swift Can't See ViPERSharedRing C Struct
+Swift target couldn't import the C header due to _Atomic types being incompatible.
+Fixed in ViPERSharedRing.h by using preprocessor guards:
+  - C++  sees: std::atomic<uint64_t>
+  - C    sees: _Atomic uint64_t
+  - Swift sees: uint64_t (same memory layout, zero-overhead)
+Added ViPERSharedRing.h to the bridging header.
+
+### Fix 7 — findRealOutputDevice() Returning nil
+With ViPER set as default output, findRealOutputDevice() was returning nil because it
+only checked the current default (which was ViPER). Fixed to iterate all devices and
+return the first alive non-ViPER device with output streams.
+
+### Fix 8 — Volume Control Not Working
+Built-in Intel Mac audio doesn't accept kAudioDevicePropertyVolumeScalar writes on
+the main element (AppleHDAEngineOutput). Pushing the virtual device's volume to the
+real device always failed silently.
+Fix: Replaced hardware volume push with software gain in Swift.
+  - syncVolumeToOutput() now caches vol/mute values into currentVolume/currentlyMuted
+  - inputIOProcCallback applies gain multiplier to samples after DSP, before writeToRing
+  - Volume slider now works correctly ✅
+
+### Fix 9 — Ring Buffer Drop-on-Full
+Old writeToRing used drop-oldest which caused audible tearing when the ring filled.
+Replaced with drop-on-full: if there's no space, skip the entire write rather than
+corrupt mid-buffer data.
+
+### Fix 10 — Sample Rate Mismatch (driver vs real device)
+Driver started at 48000 Hz, real device runs at 44100 Hz.
+Fixed with two parts:
+  (a) Driver: overrode SetNominalSampleRateImpl() to propagate rate changes to all
+      stream physical/virtual formats and update ZeroTimeStampPeriod. Added
+      SetAvailableSampleRatesAsync (44100, 48000, 88200, 96000) AFTER stream creation.
+  (b) Swift: matchSampleRates() pushes the real output device's rate to the virtual
+      device on startup, then polls until the virtual device confirms the new rate
+      (up to 500ms timeout).
+Result: Virtual device now runs at 44100 Hz, confirmed in driver.log every startup.
+
+### Fix 11 — Structured Driver Logging
+Replaced raw fprintf/fclose pattern with a proper DriverLogger class matching the
+Swift FileLogger style exactly:
+  - Timestamp format: "yyyy-MM-dd HH:mm:ss.SSS [Category][LEVEL] message"
+  - 2MB log rotation to driver.old.log
+  - Thread-safe via std::mutex
+  - LOG_DEBUG / LOG_INFO / LOG_WARN / LOG_ERROR macros
+  - Comprehensive coverage: SHM init, rate changes, overflows, underruns
+File: ViPERDriver/ViPERDriver.cpp
+
+### Fix 12 — TCC Permissions Blocking Audio Flow
+coreaudiod was zeroing out all mixed audio before passing it to the driver because
+the app was not in the System Audio Recording / Screen Recording privacy list.
+Symptom: WriteMixed max=0.000000 for all 25,000+ callbacks even with audio playing.
+Fix:
+  (a) Add ViPER4Mac.app to System Settings → Privacy → Screen & System Audio Recording
+  (b) Full system reboot required (killall coreaudiod alone is not enough for TCC)
+  (c) Added NSMicrophoneUsageDescription to ViPER4Mac/Info.plist
+Result: After reboot, max values go non-zero immediately on audio playback. ✅
+
+### Fix 13 — AudioConverter Removed for Same-Rate Path
+AudioConverter was FORCED ACTIVE even when both devices ran at 44100 Hz.
+This added unnecessary latency and a second layer of buffering complexity.
+Fix: setupAudioConverter() now returns early (isConverterActive = false) when
+inputRate and outputRate differ by less than 1 Hz. Direct ring path is used.
+Result: Simpler signal path, lower latency, no extra buffering layer.
+
+### Fix 14 — IOProc Consuming Entire SHM Ring in One Shot
+IOProc was reading min(availFrames, 4096) per callback. If SHM had accumulated
+~31744 samples (>4096 frames), the IOProc consumed all 4096 frames in one tick,
+stuffed the Swift ring, and the output callback could only drain 512 per tick.
+Result was ring overflow → dropped buffers → glitches.
+Fix:
+  (a) Steady-state: cap consumption at halBufferFrames (512) per IOProc tick
+  (b) Catch-up mode (SHM > 85% full): drain aggressively up to 4096 frames
+  (c) Ring throttle (ring > 80% full): skip the IOProc tick entirely; data
+      stays safely in SHM which is 4× larger (32768 samples capacity)
+
+### Fix 15 — SHM Ring Full at Startup (Stale Data Backlog)
+The driver starts writing to SHM as soon as coreaudiod loads it. The Swift app
+doesn't map SHM until several seconds later. By startup time, SHM was already
+97% full (31744/32768 samples), causing 1000+ overflow events in 45 seconds.
+Fix: On mapSharedMemory(), reset readPos = writePos (atomic store), discarding
+all stale pre-startup data. The app then reads only fresh samples from the moment
+the IOProc starts.
+Result: No more startup overflow cascade. shmUsed drops from 31744 to ~1114
+immediately after startup. ✅
 
 ---
 
-### ❌ Problem 3 — Architecture Mismatch (arm64 cached in x86_64 build)
-**Root cause:** A leftover arm64 XPC binary from architecture experiments got embedded into the driver bundle.
-
-**Fix:** Full `make clean` + proper arch flags everywhere.
-
----
-
-### ❌ Problem 4 — Xcode Overwrites Info.plist
-**Root cause:** Xcode's `builtin-infoPlistUtility` replaces our custom plist during build, stripping `CFPlugInFactories`, `CFPlugInTypes` and adding wrong keys.
-
-**Fix:** Added `fix-plist` step in Makefile using Python3 to patch the plist after Xcode builds it, then re-sign.
-
----
-
-## Current State
-
-### What Works ✅
-```
-Driver loads:     _coreaudiod  65487  Core Audio Driver (ViPER4Mac.driver) ✅
-Device activates: HALS_Device::Activate: activating device 62: ViPER4Mac_VirtualDevice ✅
-Default output:   FindPreferredDefaultDevice: 'dOut' ViPER4Mac_VirtualDevice ✅
-System output:    FindPreferredDefaultDevice: 'sOut' ViPER4Mac_VirtualDevice ✅
-App sees driver:  Driver version 1.0.0 shown in UI ✅
-system_profiler:  ViPER4Mac: Default Output Device: Yes ✅
-```
-
-### What Doesn't Work ❌
-```
-Streaming:  Inactive
-Audio:      No sound output
-SHM:        /com.viper4mac.shm not found — driver may not be creating it
-App status: "Streaming: Inactive"
-```
-
----
-
-## Current Architecture (Working Parts)
+## Current Architecture
 
 ```
-coreaudiod
-    └── dlopen → ViPER4Mac.driver (bundle, x86_64) ✅
-            └── ViPER4Mac_Create() called ✅
-                    └── aspl::Device "ViPER4Mac_VirtualDevice" registered ✅
-                            └── Set as Default Output ✅
+coreaudiod (root)
+  └── dlopen → ViPER4Mac.driver (bundle, x86_64) ✅
+        └── ViPER4Mac_Create()
+              └── aspl::Device "ViPER4Mac_VirtualDevice" @ 44100 Hz ✅
+                    └── OnWriteMixedOutput → /tmp/viper4mac_ring.bin (0666, 131088 bytes)
+                          278 frames/callback @ ~86 Hz (stereo interleaved)
 
-ViPER4Mac.app (running) ✅
-    └── AudioEngine.swift
-            └── Looks for virtual device ✅ (found)
-            └── mapSharedMemory() ← shm_open fails ❌
-            └── setupInputIOProc() ← never runs ❌
-            └── AudioOutputUnitStart() ← never runs ❌
-            └── Status: Streaming Inactive ❌
-```
-
----
-
-## Root Cause of Remaining Issue
-
-### Problem A — Shared Memory Not Created
-The driver's `initSharedMemory()` runs inside `ViPERIOHandler` constructor:
-```cpp
-// ViPERDriver.cpp
-ViPERIOHandler() {
-    TPCircularBufferInit(&ringBuffer_, ...);
-    initSharedMemory();  // ← creates /com.viper4mac.shm
-}
-```
-
-But `ViPERIOHandler` is created inside `ViPER4Mac_Create()` which runs as `_coreaudiod` user. The SHM should be created — but the app can't find it. Likely a **permissions or timing issue**.
-
-### Problem B — AudioEngine Never Starts
-Looking at `AudioEngine.start()`:
-```swift
-// AudioEngine.swift
-func start() {
-    // Waits up to 10 seconds for virtual device
-    var viperDevice = findViPERDevice()  // ← this should now work ✅
-
-    // Gets real output device
-    guard let realDevice = findRealOutputDevice()  // ← needs checking
-
-    // Maps shared memory
-    mapSharedMemory()  // ← shm_open("/com.viper4mac.shm") fails ❌
-
-    // Sets up IOProc
-    setupInputIOProc()
-
-    // Sets up output AUHAL
-    setupOutputUnit()
-
-    // Sets ViPER as default output
-    setDefaultOutputDevice(inputDeviceID)
-}
-```
-
-The engine may be failing at `mapSharedMemory()` and bailing out silently.
-
----
-
-## Next Steps (In Priority Order)
-
-### Step 1 — Enable Driver Logging
-Uncomment the logging in `ViPERDriver.cpp` to confirm `ViPER4Mac_Create` runs and SHM is initialized:
-
-```cpp
-// In ViPER4Mac_Create:
-FILE *f = openDriverLog();
-if (f) {
-    fprintf(f, "ViPER4Mac_Create called\n");
-    fclose(f);
-}
-
-// In initSharedMemory:
-FILE *f = openDriverLog();
-if (f) {
-    fprintf(f, "SHM init: fd=%d ptr=%p\n", fd, ptr);
-    fclose(f);
-}
-```
-
-### Step 2 — Check App Engine Start Logs
-Add temporary logging to `AudioEngine.start()` to see exactly where it fails:
-```swift
-logger.info("findViPERDevice: \(viperDevice)")
-logger.info("mapSharedMemory result: \(sharedRingPtr != nil)")
-logger.info("setupInputIOProc result: \(setupInputIOProc())")
-```
-
-### Step 3 — Fix SHM Permissions
-The driver runs as `_coreaudiod`, app runs as user `eren`. The SHM may have wrong permissions:
-```cpp
-// In initSharedMemory() - make world readable/writable
-int fd = shm_open(VIPER_SHM_FILE, O_CREAT | O_RDWR, 0666);
-fchmod(fd, 0666);  // ← add this explicitly
-```
-
-### Step 4 — Fix findRealOutputDevice()
-With ViPER now set as default output, `findRealOutputDevice()` may return `nil` because:
-```swift
-private func findRealOutputDevice() -> AudioDeviceID? {
-    let currentDefault = getDefaultOutputDevice()
-    // currentDefault IS ViPER now — so this returns nil!
-    if getDeviceUID(currentDefault) != viperUID ...
-}
-```
-
-The engine needs to find the **real speakers** before it sets ViPER as default.
-
-### Step 5 — Fix Engine Start Order
-```swift
-// Current (wrong on first run):
-// 1. Find ViPER device ✅
-// 2. Get default output → returns ViPER (wrong!) ❌
-// 3. Map SHM
-// 4. Start IOProc
-
-// Fixed order:
-// 1. Find ViPER device
-// 2. Save current default BEFORE installing ViPER
-// 3. Find real output from saved default
-// 4. Map SHM
-// 5. Start IOProc
-// 6. Set ViPER as default
+ViPER4Mac.app (user eren)
+  └── AudioEngine.swift
+        ├── mapSharedMemory() → resets readPos=writePos on open ✅
+        ├── matchSampleRates() → pushes 44100 Hz to virtual device ✅
+        ├── IOProc on virtual device (adaptive consumption)
+        │     → reads SHM ring (up to 512 frames/tick, skip if ring > 80% full)
+        │     → ViPER DSP processing
+        │     → software volume gain (currentVolume * sample)
+        │     → writeToRing (app-local ring, 8192 frames capacity)
+        ├── AUHAL output callback → readFromRing → real speakers ✅
+        └── Volume listener on virtual device → caches vol/mute ✅
 ```
 
 ---
 
-## Key Log Evidence (Latest Session)
+## Current Status
 
-```
-# Driver loading perfectly now:
-HALS_RemotePlugInRegistrar.mm:421  Creating remote driver service: ViPER4Mac.driver, pid: 65487
-HALS_Device::Activate: activating device 62: ViPER4Mac_VirtualDevice
-Registering factory A2E1C4F1-9B23-4A84-9D5D-7E1A4F6B8C9D ViPER4Mac_Create
-FindPreferredDefaultDevice: 'dOut' found preferred[0] 62: ViPER4Mac_VirtualDevice
-
-# App running but audio engine not starting:
-_coreaudiod  65487  Core Audio Driver (ViPER4Mac.driver)  ← driver process alive
-ViPER4Mac    65287  /Applications/ViPER4Mac.app           ← app running
-# But: no IOProc callbacks, no SHM, no audio flow
-```
+Audio flows end-to-end. DSP effects apply. Volume control works.
+Glitches reduced from constant crackling to occasional pops (~15% of previous severity).
 
 ---
 
-## Build Pipeline (Current — Working)
+## Remaining Issues ❌
 
-```
+### Issue 1 — Audio Plays Slower Than Normal Speed (CRITICAL)
+
+**Symptom:**
+Audio sounds slightly slower/lower-pitched than real speed when processing is enabled.
+Disabling processing restores normal speed, re-enabling brings back the slowdown.
+
+**Root cause (suspected):**
+The virtual device and the real output device are two independent hardware clocks.
+Even though both are set to 44100 Hz nominally, their actual oscillator frequencies
+differ by a tiny amount (clock drift). Over time this causes the ring buffer to
+either slowly fill (if virtual runs slightly faster → slowdown) or drain (underrun).
+
+Current architecture has NO clock domain bridging between the two devices.
+The IOProc writes at the virtual device's clock rate; the AUHAL output reads at
+the real device's clock rate. These rates diverge by tens of ppm over time.
+
+**What this looks like in logs:**
+- shmUsed oscillates between ~9000-23000 (not stable) — indicates rate mismatch
+- The driver delivers 278-279 frames alternating (not a clean 278.0) — HAL is
+  compensating for the drift internally but we're not
+
+**Proposed fix:**
+Implement AudioConverter-based ASRC (Asynchronous Sample Rate Conversion) between
+the IOProc and the AUHAL output. Even at "44100→44100", the AudioConverter with
+kAudioConverterSampleRateConverterQuality_Max acts as a rubber-band that absorbs
+clock drift transparently. This was previously attempted but disabled because it
+was FORCED ACTIVE even at matching rates (causing extra latency). The correct
+approach is to keep it active but configure it properly so it only engages when
+drift is detected, not as a constant conversion step.
+
+Alternative: Use a simple feedback loop — if ringAvail drifts above or below a
+target (e.g. 4096 frames), nudge the read rate by ±1 sample per callback to
+compensate without introducing the AudioConverter overhead.
+
+### Issue 2 — Occasional Glitches / Pops (MODERATE)
+
+**Symptom:**
+Infrequent audio pops, reduced from constant crackling but not eliminated.
+
+**Root cause (suspected):**
+Same clock drift as Issue 1. When the ring buffer drains to near-empty, the
+output callback's readFromRing() hits the underflow branch and zero-fills
+some samples → audible silence gap → pop when audio resumes.
+
+Also possible: the 80%/85% thresholds in the IOProc flow control cause brief
+over/under-production phases that create small discontinuities.
+
+**Evidence from logs:**
+- shmUsed varies between 9544 and 23250 over ~2 minutes (not stable)
+- ringAvail stable at 4895 for 1 minute (good) then occasional drops
+
+**Proposed fix:**
+Same as Issue 1 (ASRC). Once clock drift is absorbed, the ring level will be
+stable and the underflow branch in readFromRing will never trigger.
+
+---
+
+## Next Steps
+
+### Step 1 — Implement proper ASRC to fix clock drift
+Re-enable AudioConverter but correctly this time:
+  - Only activate when both devices have the same nominal rate (same-rate ASRC)
+  - Configure with kAudioConverterQuality_Max for smooth resampling
+  - The converter's job is NOT rate conversion but clock domain bridging —
+    it will consume slightly more or fewer samples per output callback to
+    keep the ring buffer level stable
+  - Key insight: AudioConverterFillComplexBuffer pulls data from the
+    converterDataProc; by controlling how much we provide, we naturally
+    regulate the ring level
+
+### Step 2 — Or: implement a simple drift correction without AudioConverter
+If ASRC is too complex/introduces latency, implement a lightweight feedback loop:
+  - Target ring level: 4096 frames (50% of 8192 capacity)
+  - If ringAvail > 4096+256: skip one IOProc tick (output drains faster)
+  - If ringAvail < 4096-256: consume an extra 64 frames from SHM this tick
+  - This creates a soft PLL that corrects clock drift without sample-rate math
+
+### Step 3 — Fine-tune IOProc thresholds after Step 1 or 2
+Once clock drift is handled, re-examine the 80%/85% thresholds to see if
+they can be relaxed or removed entirely.
+
+---
+
+## Key Files
+
+| File | Role |
+|------|------|
+| ViPERDriver/ViPERDriver.cpp | C++ HAL plugin, runs as _coreaudiod |
+| ViPERDriver/ViPERSharedRing.h | Shared memory struct (C/C++/Swift compatible) |
+| ViPER4Mac/Audio/AudioEngine.swift | Swift audio engine, IOProc + AUHAL |
+| ViPER4Mac/Bridge/ViPER4Mac-Bridging-Header.h | Exposes C headers to Swift |
+| ViPER4Mac/Model/ViPERState.swift | DSP parameter state |
+| ViPER4Mac/Info.plist | App plist — must include NSMicrophoneUsageDescription |
+| Vendor/libASPL/ | Apple HAL plugin wrapper library |
+
+---
+
+## Build & Install Pipeline
+
+```bash
 make clean && make build && make install
-    ├── xcodebuild ViPER4Mac.app          (Swift UI + AudioEngine)
-    ├── xcodebuild ViPERDSP               (C++ DSP library)  
-    ├── xcodebuild ViPERDriver            (HAL bundle)
-    ├── fix-plist                         (patch UUIDs via python3)
-    └── resign                            (codesign the bundle)
 
-Install:
-    ├── cp driver → /Library/Audio/Plug-Ins/HAL/
-    ├── cp app    → /Applications/
-    ├── chown/chmod/xattr
-    ├── codesign
-    └── killall coreaudiod
+# Install steps:
+sudo rm -rf /Library/Audio/Plug-Ins/HAL/ViPER4Mac.driver
+sudo cp -R build/Release/ViPER4Mac.driver /Library/Audio/Plug-Ins/HAL/
+sudo chown -R root:wheel /Library/Audio/Plug-Ins/HAL/ViPER4Mac.driver
+sudo codesign -f -s - --deep /Library/Audio/Plug-Ins/HAL/ViPER4Mac.driver
+sudo killall coreaudiod
 ```
 
 ---
 
-## Files Modified This Session
+## Useful Diagnostic Commands
 
-| File | Change |
-|------|--------|
-| `ViPERDriver/Info.plist` | Fixed Plugin Type UUID to `443ABAB8` |
-| `Makefile` | Removed XPC, added fix-plist + resign |
-| `ViPERDriver/ViPERDriverMain.cpp` | Created (not needed anymore, can remove) |
-| `ViPERDriver/XPCService-Info.plist` | Created (not needed anymore, can remove) |
+```bash
+# Driver log (C++ side, runs as _coreaudiod):
+cat /Library/Logs/ViPER4Mac/driver.log
+
+# App log (Swift side, runs as user):
+tail -f ~/Library/Logs/ViPER4Mac/viper.log
+
+# Live coreaudiod stream:
+sudo log stream --predicate 'process == "coreaudiod"' --debug | grep -i viper
+
+# Check SHM file:
+ls -la /tmp/viper4mac_ring.bin
+# Should be: -rw-rw-rw- _coreaudiod wheel 131088
+
+# Check real output device sample rate:
+system_profiler SPAudioDataType | grep -A 5 "Built-in Output"
+
+# Watch ring buffer health live (run while audio plays):
+tail -f ~/Library/Logs/ViPER4Mac/viper.log | grep -E "IOPROC|OUTPUT"
+# Healthy: ringPct=50-65%, shmAvail=500-15000, shmCatchUp=false
+# Unhealthy: ringPct>80% or <10%, shmAvail>27000, shmCatchUp=true repeatedly
+```
 
 ---
 
-## What To Do Next Session
+## Key Metrics (Healthy Steady State)
 
-1. **Enable driver logging** → confirm SHM creation
-2. **Fix `findRealOutputDevice()`** → must find speakers before ViPER becomes default
-3. **Fix SHM permissions** → `fchmod(fd, 0666)` after `shm_open`
-4. **Test audio flow** → play audio, verify IOProc callbacks fire
-5. **Fix volume sync** → volume control between virtual and real device
-6. **Test DSP chain** → verify ViPER effects are applied
-7. **UI polish** → EQ display, profile management
+| Metric | Healthy Range | Meaning |
+|--------|--------------|---------|
+| shmUsed (driver) | 500–5000 | SHM ring not backing up |
+| shmAvail (IOProc) | 500–16000 | Sufficient but not overflowing |
+| ringPct | 40–70% | Ring buffer has healthy headroom |
+| shmCatchUp | false | Not in backlog recovery |
+| WriteMixed max | > 0.001 | Real audio is flowing (not silence) |
+| IOPROC max | > 0.001 | Audio reaching Swift side |
+| OUTPUT max | > 0.001 | Audio reaching speakers |
+
+
+### Fix 16 — Audio Plays Slower Than Normal Speed (CRITICAL — RESOLVED)
+
+**Root Cause:**
+The driver was starting at 48000 Hz (kViPERDefaultSampleRate). The HAL schedules
+its entire I/O timeline at driver creation time based on ZeroTimeStampPeriod.
+Even after SetNominalSampleRate(44100) was called successfully, the HAL's internal
+mix engine was already locked to the 48000 Hz cadence, delivering 278 frames per
+callback instead of 512.
+
+The result: driver wrote ~47,800 frames/sec into SHM, Swift output consumed
+~44,100 frames/sec → audio played back at ~94% speed (slow/lower-pitched).
+
+**Fix:**
+Changed driver initial rate from 48000 → 44100 Hz in ViPER4Mac_Create():
+  const Float64 initialRate = 44100.0;  // was kViPERDefaultSampleRate (48000)
+  deviceParams.ZeroTimeStampPeriod = (UInt32)initialRate;  // 44100
+
+Removed matchSampleRates() from AudioEngine.swift — no rate adjustment needed
+since driver and real device both start at 44100 Hz.
+
+Added ring-level PLL in IOProc for tiny residual clock drift (±1 frame per
+100 callbacks) — handles the ~10-100 ppm oscillator difference between the
+virtual device and real hardware without any audible pitch change.
+
+**Result:**
+  - frames=512 per callback (correct for 44100 Hz)
+  - shmUsed=512 (stable, not growing)
+  - ringPct=40% (healthy, PLL maintaining target)
+  - No pitch shift, no glitches, no slowdown ✅
+
+### Fix 17 — Removed Unnecessary Audio Converter for Same-Rate Path (CLEANUP)
+
+AudioConverter was previously re-enabled "for clock drift" but was broken:
+  1. Passthrough closure never set ioNumberDataPackets → 0 output frames
+  2. Rate adjustment math was inverted (decreased rate when ring was empty)
+  3. Drove effectiveOutputRate to 43879 Hz → complete silence
+
+Fixed by reverting to direct ring write for same-rate path.
+AudioConverter is now ONLY active when rates actually differ (future use).
+Clock drift handled by PLL instead — simpler, lower latency, correct.
+

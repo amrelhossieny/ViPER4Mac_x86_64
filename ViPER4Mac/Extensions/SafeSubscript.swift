@@ -1,3 +1,4 @@
+//ViPER4Mac/Extensions/SafeSubscript.swift
 import Foundation
 
 extension Array {

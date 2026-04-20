@@ -1,3 +1,5 @@
+//ViPER4Mac/UI/MainWindow.swift
+
 import CoreAudio
 import Foundation
 import SwiftUI
