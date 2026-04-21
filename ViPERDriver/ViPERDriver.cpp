@@ -11,8 +11,11 @@
 #include <cstdarg>
 #include <cstdio>
 #include <ctime>
+#include <dispatch/dispatch.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <mutex>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -111,7 +114,6 @@ private:
         }
     }
 
-    // Format: "2026-04-20 14:33:07.123 [Category][LEVEL] message\n"
     void logv(const char *level, const char *category, const char *fmt, va_list args) {
         std::lock_guard<std::mutex> lock(mutex_);
         rotateIfNeeded();
@@ -120,7 +122,6 @@ private:
             if (!file_) return;
         }
 
-        // Timestamp with milliseconds — matches Swift dateFormatter exactly
         struct timeval tv;
         gettimeofday(&tv, nullptr);
         struct tm tm;
@@ -139,7 +140,6 @@ private:
     }
 };
 
-// Convenience macros so call sites stay clean
 #define LOG_DEBUG(cat, ...) DriverLogger::shared().debug(cat, __VA_ARGS__)
 #define LOG_INFO(cat, ...) DriverLogger::shared().info(cat, __VA_ARGS__)
 #define LOG_WARN(cat, ...) DriverLogger::shared().warning(cat, __VA_ARGS__)
@@ -154,6 +154,8 @@ static const char *kViPERDeviceName = "ViPER4Mac";
 static const UInt32 kViPERChannelCount = 2;
 static const UInt32 kViPERDefaultSampleRate = 48000;
 static const UInt32 kViPERRingBufferFrames = 16384;
+
+static const char *kViPERPIDFile = "/tmp/viper4mac.pid";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - ViPERIOHandler
@@ -171,10 +173,15 @@ public:
             &ringBuffer_, kViPERRingBufferFrames * kViPERChannelCount * sizeof(Float32)
         );
         initSharedMemory();
+        startLifecycleMonitor();
     }
 
     ~ViPERIOHandler() override {
-        LOG_INFO("IOHandler", "Destroying — cleanup TPCircularBuffer + SHM");
+        LOG_INFO("IOHandler", "Destroying — cleanup TPCircularBuffer + SHM + lifecycle");
+        if (lifecycleTimer_) {
+            dispatch_source_cancel(lifecycleTimer_);
+            lifecycleTimer_ = nullptr;
+        }
         TPCircularBufferCleanup(&ringBuffer_);
         if (sharedRing_) {
             munmap(sharedRing_, VIPER_SHM_SIZE);
@@ -219,7 +226,6 @@ public:
                     memory_order_release
                 );
             } else {
-                // Log SHM overflow (drop-on-full)
                 shmOverflowCount_++;
                 if (shmOverflowCount_ <= 3 || shmOverflowCount_ % 1000 == 0) {
                     LOG_WARN(
@@ -239,7 +245,6 @@ public:
 
         writeCount_++;
 
-        // Periodic diagnostic — every 5000 writes (~5 seconds at typical callback rates)
         if (writeCount_ % 5000 == 1) {
             const float *src = static_cast<const float *>(bytes);
             uint32_t sampleCount = bytesCount / sizeof(float);
@@ -309,6 +314,12 @@ private:
     std::atomic<uint64_t> readUnderrunCount_{0};
     ViPERSharedRing *sharedRing_ = nullptr;
 
+    // App lifecycle monitoring
+    dispatch_source_t lifecycleTimer_ = nullptr;
+    pid_t monitoredPID_ = 0;
+    bool appWasPreviouslyAlive_ = false;
+    uint64_t lifecycleCheckCount_ = 0;
+
     void initSharedMemory() {
         LOG_INFO("SHM", "Initializing shared memory at %s", VIPER_SHM_PATH);
 
@@ -371,7 +382,6 @@ private:
         atomic_store_explicit(&sharedRing_->readPos, 0, memory_order_relaxed);
         memset(sharedRing_->samples, 0, sizeof(sharedRing_->samples));
 
-        // Verify file permissions
         struct stat st;
         if (stat(VIPER_SHM_PATH, &st) == 0) {
             LOG_INFO(
@@ -386,6 +396,182 @@ private:
         } else {
             LOG_INFO("SHM", "OK ptr=%p size=%zu (stat failed)", ptr, shmSize);
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // MARK: - App Lifecycle Monitor
+    // ─────────────────────────────────────────────────────────────────────────
+
+    void startLifecycleMonitor() {
+        LOG_INFO("Lifecycle", "Starting app lifecycle monitor (polling every 2s)");
+
+        dispatch_queue_t queue = dispatch_queue_create(
+            "com.viper4mac.lifecycle", DISPATCH_QUEUE_SERIAL);
+
+        lifecycleTimer_ = dispatch_source_create(
+            DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+
+        dispatch_source_set_timer(lifecycleTimer_,
+            dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+            2 * NSEC_PER_SEC,
+            NSEC_PER_SEC / 2);
+
+        // Capture 'this' explicitly for the block
+        ViPERIOHandler *handler = this;
+        dispatch_source_set_event_handler(lifecycleTimer_, ^{
+            handler->checkAppAlive();
+        });
+
+        dispatch_resume(lifecycleTimer_);
+        LOG_INFO("Lifecycle", "Timer created and resumed on queue com.viper4mac.lifecycle");
+    }
+
+    void checkAppAlive() {
+        lifecycleCheckCount_++;
+
+        // Log every 30th check (~60s) to prove timer is ticking
+        if (lifecycleCheckCount_ % 30 == 1) {
+            LOG_DEBUG("Lifecycle",
+                "Tick #%llu pid=%d wasAlive=%s",
+                lifecycleCheckCount_, monitoredPID_,
+                appWasPreviouslyAlive_ ? "yes" : "no");
+        }
+
+        // Try to read PID file
+        FILE *f = fopen(kViPERPIDFile, "r");
+        if (!f) {
+            // No PID file exists
+            if (appWasPreviouslyAlive_) {
+                LOG_WARN("Lifecycle",
+                    "PID file disappeared — app exited cleanly, switching output");
+                appWasPreviouslyAlive_ = false;
+                monitoredPID_ = 0;
+                drainSHM();
+                switchToNextOutput();
+            }
+            return;
+        }
+
+        char buf[32] = {0};
+        if (fgets(buf, sizeof(buf), f) == nullptr) {
+            fclose(f);
+            LOG_WARN("Lifecycle", "PID file empty, ignoring");
+            return;
+        }
+        fclose(f);
+
+        // Strip newline
+        size_t blen = strlen(buf);
+        if (blen > 0 && buf[blen - 1] == '\n') buf[blen - 1] = '\0';
+
+        pid_t pid = (pid_t) atoi(buf);
+        if (pid <= 0) {
+            LOG_WARN("Lifecycle", "Invalid PID in file: '%s'", buf);
+            return;
+        }
+
+        // Track PID changes
+        if (monitoredPID_ != pid) {
+            LOG_INFO("Lifecycle", "Monitoring new PID=%d (was %d)", pid, monitoredPID_);
+            monitoredPID_ = pid;
+        }
+
+        // Check if process is alive
+        // kill(pid, 0) returns 0 if process exists, -1 otherwise
+        // errno == ESRCH means no such process
+        // errno == EPERM means process exists but we can't signal it (still alive)
+        int result = kill(pid, 0);
+        int err = errno;
+
+        if (result == 0 || err == EPERM) {
+            // Process is alive
+            if (!appWasPreviouslyAlive_) {
+                LOG_INFO("Lifecycle", "App now alive PID=%d", pid);
+                appWasPreviouslyAlive_ = true;
+            }
+        } else {
+            // Process is dead (ESRCH or other error)
+            if (appWasPreviouslyAlive_) {
+                LOG_WARN("Lifecycle",
+                    "*** APP DIED PID=%d errno=%d(%s) — switching output ***",
+                    pid, err, strerror(err));
+                appWasPreviouslyAlive_ = false;
+                monitoredPID_ = 0;
+
+                // Remove stale PID file
+                int unlinkResult = unlink(kViPERPIDFile);
+                if (unlinkResult != 0) {
+                    LOG_WARN("Lifecycle",
+                        "unlink(%s) failed errno=%d(%s) — truncating instead",
+                        kViPERPIDFile, errno, strerror(errno));
+                    // Fallback: truncate the file to 0 bytes so we read nothing next tick
+                    int tfd = open(kViPERPIDFile, O_WRONLY | O_TRUNC);
+                    if (tfd >= 0) close(tfd);
+                }
+
+                // Drain SHM so it's clean for reconnection
+                drainSHM();
+
+                // Switch audio output away from ViPER4Mac
+                switchToNextOutput();
+            }
+            // else: already handled, don't spam logs — silently wait for new PID file
+        }
+    }
+
+    void drainSHM() {
+        if (sharedRing_) {
+            uint64_t wp = atomic_load_explicit(
+                &sharedRing_->writePos, memory_order_relaxed);
+            atomic_store_explicit(
+                &sharedRing_->readPos, wp, memory_order_release);
+            LOG_INFO("Lifecycle", "Drained SHM ring (readPos=writePos=%llu)", wp);
+        }
+    }
+
+    void switchToNextOutput() {
+        LOG_INFO("Lifecycle", "Looking for SwitchAudioSource...");
+
+        const char *paths[] = {
+            "/usr/local/bin/SwitchAudioSource",     // Intel Homebrew
+            "/opt/homebrew/bin/SwitchAudioSource",   // Apple Silicon Homebrew
+            nullptr
+        };
+
+        for (int i = 0; paths[i]; i++) {
+            struct stat st;
+            if (stat(paths[i], &st) == 0) {
+                LOG_INFO("Lifecycle", "Found at %s — executing -n", paths[i]);
+
+                char cmd[256];
+                snprintf(cmd, sizeof(cmd), "%s -n 2>&1", paths[i]);
+
+                FILE *pipe = popen(cmd, "r");
+                if (pipe) {
+                    char result[256] = {0};
+                    fgets(result, sizeof(result), pipe);
+                    int status = pclose(pipe);
+
+                    // Strip trailing newline
+                    size_t len = strlen(result);
+                    if (len > 0 && result[len - 1] == '\n') {
+                        result[len - 1] = '\0';
+                    }
+
+                    LOG_INFO("Lifecycle",
+                        "SwitchAudioSource result: \"%s\" (exit=%d)", result, status);
+                    return;
+                } else {
+                    LOG_ERROR("Lifecycle",
+                        "popen(%s) failed errno=%d(%s)", paths[i], errno, strerror(errno));
+                }
+            } else {
+                LOG_DEBUG("Lifecycle", "Not found at %s", paths[i]);
+            }
+        }
+
+        LOG_ERROR("Lifecycle",
+            "SwitchAudioSource not found — user must switch manually");
     }
 };
 
@@ -427,14 +613,12 @@ public:
         return status;
     }
 
-    // Replace the entire SetNominalSampleRateImpl with this minimal version:
     OSStatus SetNominalSampleRateImpl(Float64 rate) override {
         Float64 oldRate = GetNominalSampleRate();
         LOG_INFO(
             "Device", "SetNominalSampleRate: requested=%.0f current=%.0f", rate, oldRate
         );
 
-        // Just verify we're already at the requested rate (we always will be now)
         if (abs(rate - oldRate) > 1.0) {
             LOG_WARN(
                 "Device",
@@ -444,7 +628,6 @@ public:
             );
         }
 
-        // Update ZeroTimeStampPeriod (should already match)
         UInt32 newPeriod = (UInt32) rate;
         SetZeroTimeStampPeriodAsync(newPeriod);
 
@@ -480,7 +663,6 @@ extern "C" void *ViPER4Mac_Create(CFAllocatorRef allocator, CFUUIDRef typeUUID) 
     LOG_INFO("Plugin", "ViPER4Mac_Create called");
 
     if (!CFEqual(typeUUID, kAudioServerPlugInTypeUUID)) {
-        // Log the UUID we received for debugging
         CFStringRef desc = CFCopyDescription(typeUUID);
         if (desc) {
             char buf[256];
@@ -497,12 +679,7 @@ extern "C" void *ViPER4Mac_Create(CFAllocatorRef allocator, CFUUIDRef typeUUID) 
 
     LOG_INFO("Plugin", "typeUUID matches kAudioServerPlugInTypeUUID — proceeding");
 
-    // NOTE: We cannot query kAudioHardwarePropertyDefaultOutputDevice here
-    // because AudioServerPlugIn.h deliberately excludes client-side HAL APIs.
-    // The Swift app calls matchSampleRates() on startup which immediately
-    // pushes the correct rate via SetNominalSampleRateImpl — so starting at
-    // 48000 and letting it be corrected within ~60ms is correct behavior.
-    const Float64 initialRate = 44100.0; // ← CHANGE THIS LINE
+    const Float64 initialRate = 44100.0;
 
     LOG_INFO("Plugin", "Creating context and IOHandler");
     auto context = std::make_shared<aspl::Context>();
@@ -518,8 +695,6 @@ extern "C" void *ViPER4Mac_Create(CFAllocatorRef allocator, CFUUIDRef typeUUID) 
     deviceParams.CanBeDefaultForSystemSounds = true;
     deviceParams.Latency = 0;
     deviceParams.SafetyOffset = 0;
-    // ZeroTimeStampPeriod MUST equal SampleRate — this controls audio playback speed.
-    // SetNominalSampleRateImpl updates this when the Swift app changes the rate.
     deviceParams.ZeroTimeStampPeriod = (UInt32) initialRate;
     deviceParams.ClockIsStable = true;
 

@@ -1,5 +1,5 @@
 # ViPER4Mac — Progress Report
-Last updated: 2026-04-20
+Last updated: 2026-04-21
 
 ---
 
@@ -118,194 +118,6 @@ the IOProc starts.
 Result: No more startup overflow cascade. shmUsed drops from 31744 to ~1114
 immediately after startup. ✅
 
----
-
-## Current Architecture
-
-```
-coreaudiod (root)
-  └── dlopen → ViPER4Mac.driver (bundle, x86_64) ✅
-        └── ViPER4Mac_Create()
-              └── aspl::Device "ViPER4Mac_VirtualDevice" @ 44100 Hz ✅
-                    └── OnWriteMixedOutput → /tmp/viper4mac_ring.bin (0666, 131088 bytes)
-                          278 frames/callback @ ~86 Hz (stereo interleaved)
-
-ViPER4Mac.app (user eren)
-  └── AudioEngine.swift
-        ├── mapSharedMemory() → resets readPos=writePos on open ✅
-        ├── matchSampleRates() → pushes 44100 Hz to virtual device ✅
-        ├── IOProc on virtual device (adaptive consumption)
-        │     → reads SHM ring (up to 512 frames/tick, skip if ring > 80% full)
-        │     → ViPER DSP processing
-        │     → software volume gain (currentVolume * sample)
-        │     → writeToRing (app-local ring, 8192 frames capacity)
-        ├── AUHAL output callback → readFromRing → real speakers ✅
-        └── Volume listener on virtual device → caches vol/mute ✅
-```
-
----
-
-## Current Status
-
-Audio flows end-to-end. DSP effects apply. Volume control works.
-Glitches reduced from constant crackling to occasional pops (~15% of previous severity).
-
----
-
-## Remaining Issues ❌
-
-### Issue 1 — Audio Plays Slower Than Normal Speed (CRITICAL)
-
-**Symptom:**
-Audio sounds slightly slower/lower-pitched than real speed when processing is enabled.
-Disabling processing restores normal speed, re-enabling brings back the slowdown.
-
-**Root cause (suspected):**
-The virtual device and the real output device are two independent hardware clocks.
-Even though both are set to 44100 Hz nominally, their actual oscillator frequencies
-differ by a tiny amount (clock drift). Over time this causes the ring buffer to
-either slowly fill (if virtual runs slightly faster → slowdown) or drain (underrun).
-
-Current architecture has NO clock domain bridging between the two devices.
-The IOProc writes at the virtual device's clock rate; the AUHAL output reads at
-the real device's clock rate. These rates diverge by tens of ppm over time.
-
-**What this looks like in logs:**
-- shmUsed oscillates between ~9000-23000 (not stable) — indicates rate mismatch
-- The driver delivers 278-279 frames alternating (not a clean 278.0) — HAL is
-  compensating for the drift internally but we're not
-
-**Proposed fix:**
-Implement AudioConverter-based ASRC (Asynchronous Sample Rate Conversion) between
-the IOProc and the AUHAL output. Even at "44100→44100", the AudioConverter with
-kAudioConverterSampleRateConverterQuality_Max acts as a rubber-band that absorbs
-clock drift transparently. This was previously attempted but disabled because it
-was FORCED ACTIVE even at matching rates (causing extra latency). The correct
-approach is to keep it active but configure it properly so it only engages when
-drift is detected, not as a constant conversion step.
-
-Alternative: Use a simple feedback loop — if ringAvail drifts above or below a
-target (e.g. 4096 frames), nudge the read rate by ±1 sample per callback to
-compensate without introducing the AudioConverter overhead.
-
-### Issue 2 — Occasional Glitches / Pops (MODERATE)
-
-**Symptom:**
-Infrequent audio pops, reduced from constant crackling but not eliminated.
-
-**Root cause (suspected):**
-Same clock drift as Issue 1. When the ring buffer drains to near-empty, the
-output callback's readFromRing() hits the underflow branch and zero-fills
-some samples → audible silence gap → pop when audio resumes.
-
-Also possible: the 80%/85% thresholds in the IOProc flow control cause brief
-over/under-production phases that create small discontinuities.
-
-**Evidence from logs:**
-- shmUsed varies between 9544 and 23250 over ~2 minutes (not stable)
-- ringAvail stable at 4895 for 1 minute (good) then occasional drops
-
-**Proposed fix:**
-Same as Issue 1 (ASRC). Once clock drift is absorbed, the ring level will be
-stable and the underflow branch in readFromRing will never trigger.
-
----
-
-## Next Steps
-
-### Step 1 — Implement proper ASRC to fix clock drift
-Re-enable AudioConverter but correctly this time:
-  - Only activate when both devices have the same nominal rate (same-rate ASRC)
-  - Configure with kAudioConverterQuality_Max for smooth resampling
-  - The converter's job is NOT rate conversion but clock domain bridging —
-    it will consume slightly more or fewer samples per output callback to
-    keep the ring buffer level stable
-  - Key insight: AudioConverterFillComplexBuffer pulls data from the
-    converterDataProc; by controlling how much we provide, we naturally
-    regulate the ring level
-
-### Step 2 — Or: implement a simple drift correction without AudioConverter
-If ASRC is too complex/introduces latency, implement a lightweight feedback loop:
-  - Target ring level: 4096 frames (50% of 8192 capacity)
-  - If ringAvail > 4096+256: skip one IOProc tick (output drains faster)
-  - If ringAvail < 4096-256: consume an extra 64 frames from SHM this tick
-  - This creates a soft PLL that corrects clock drift without sample-rate math
-
-### Step 3 — Fine-tune IOProc thresholds after Step 1 or 2
-Once clock drift is handled, re-examine the 80%/85% thresholds to see if
-they can be relaxed or removed entirely.
-
----
-
-## Key Files
-
-| File | Role |
-|------|------|
-| ViPERDriver/ViPERDriver.cpp | C++ HAL plugin, runs as _coreaudiod |
-| ViPERDriver/ViPERSharedRing.h | Shared memory struct (C/C++/Swift compatible) |
-| ViPER4Mac/Audio/AudioEngine.swift | Swift audio engine, IOProc + AUHAL |
-| ViPER4Mac/Bridge/ViPER4Mac-Bridging-Header.h | Exposes C headers to Swift |
-| ViPER4Mac/Model/ViPERState.swift | DSP parameter state |
-| ViPER4Mac/Info.plist | App plist — must include NSMicrophoneUsageDescription |
-| Vendor/libASPL/ | Apple HAL plugin wrapper library |
-
----
-
-## Build & Install Pipeline
-
-```bash
-make clean && make build && make install
-
-# Install steps:
-sudo rm -rf /Library/Audio/Plug-Ins/HAL/ViPER4Mac.driver
-sudo cp -R build/Release/ViPER4Mac.driver /Library/Audio/Plug-Ins/HAL/
-sudo chown -R root:wheel /Library/Audio/Plug-Ins/HAL/ViPER4Mac.driver
-sudo codesign -f -s - --deep /Library/Audio/Plug-Ins/HAL/ViPER4Mac.driver
-sudo killall coreaudiod
-```
-
----
-
-## Useful Diagnostic Commands
-
-```bash
-# Driver log (C++ side, runs as _coreaudiod):
-cat /Library/Logs/ViPER4Mac/driver.log
-
-# App log (Swift side, runs as user):
-tail -f ~/Library/Logs/ViPER4Mac/viper.log
-
-# Live coreaudiod stream:
-sudo log stream --predicate 'process == "coreaudiod"' --debug | grep -i viper
-
-# Check SHM file:
-ls -la /tmp/viper4mac_ring.bin
-# Should be: -rw-rw-rw- _coreaudiod wheel 131088
-
-# Check real output device sample rate:
-system_profiler SPAudioDataType | grep -A 5 "Built-in Output"
-
-# Watch ring buffer health live (run while audio plays):
-tail -f ~/Library/Logs/ViPER4Mac/viper.log | grep -E "IOPROC|OUTPUT"
-# Healthy: ringPct=50-65%, shmAvail=500-15000, shmCatchUp=false
-# Unhealthy: ringPct>80% or <10%, shmAvail>27000, shmCatchUp=true repeatedly
-```
-
----
-
-## Key Metrics (Healthy Steady State)
-
-| Metric | Healthy Range | Meaning |
-|--------|--------------|---------|
-| shmUsed (driver) | 500–5000 | SHM ring not backing up |
-| shmAvail (IOProc) | 500–16000 | Sufficient but not overflowing |
-| ringPct | 40–70% | Ring buffer has healthy headroom |
-| shmCatchUp | false | Not in backlog recovery |
-| WriteMixed max | > 0.001 | Real audio is flowing (not silence) |
-| IOPROC max | > 0.001 | Audio reaching Swift side |
-| OUTPUT max | > 0.001 | Audio reaching speakers |
-
-
 ### Fix 16 — Audio Plays Slower Than Normal Speed (CRITICAL — RESOLVED)
 
 **Root Cause:**
@@ -347,3 +159,259 @@ Fixed by reverting to direct ring write for same-rate path.
 AudioConverter is now ONLY active when rates actually differ (future use).
 Clock drift handled by PLL instead — simpler, lower latency, correct.
 
+### Fix 18 — App Force-Kill Causes Permanent Silence (CRITICAL — RESOLVED)
+
+**Root Cause:**
+When the ViPER4Mac app was force-killed (kill, kill -9, Activity Monitor),
+applicationWillTerminate never fired, so:
+  1. The system default output stayed set to ViPER4Mac virtual device
+  2. All audio routed into the virtual device → driver wrote to SHM
+  3. No consumer read from SHM → ring filled in ~0.7 seconds
+  4. Driver dropped every frame → permanent silence
+  5. User had to manually switch output device to restore audio
+
+**Fix — Driver-side lifecycle monitor:**
+Added a dispatch_source timer in ViPERIOHandler that polls every 2 seconds:
+  (a) Swift app writes its PID to /tmp/viper4mac.pid on start()
+  (b) Swift app removes /tmp/viper4mac.pid on stop() (clean shutdown)
+  (c) Driver reads PID file, calls kill(pid, 0) to check if process exists
+  (d) If kill() returns ESRCH (no such process) and app was previously alive:
+      - Removes stale PID file (or truncates if unlink fails due to /tmp sticky bit)
+      - Drains SHM ring (readPos = writePos) for clean reconnection
+      - Executes SwitchAudioSource -n to cycle output to next real device
+
+**Dependencies:**
+  - Requires `switchaudio-osx` (brew install switchaudio-osx)
+  - Searches both /usr/local/bin and /opt/homebrew/bin for SwitchAudioSource
+  - If not found, logs error but doesn't crash — user must switch manually
+
+**Result:**
+  - App force-killed → driver detects within 2 seconds
+  - Output auto-switches to next real device (e.g. "soundcore P30i")
+  - No manual intervention needed ✅
+
+**Log evidence:**
+  ```
+  13:07:42.002 [Lifecycle][WARN] *** APP DIED PID=6714 — switching output ***
+  13:07:42.002 [Lifecycle][INFO] Drained SHM ring (readPos=writePos=24576)
+  13:07:42.102 [Lifecycle][INFO] SwitchAudioSource result: "output audio device set to "soundcore P30i"" (exit=0)
+  ```
+
+### Fix 19 — Stale PID File Log Spam After App Death (MINOR — RESOLVED)
+
+**Root Cause:**
+After the app died and the driver switched output, the PID file couldn't be
+deleted because the driver runs as _coreaudiod (root) and /tmp has the sticky
+bit set — only the file owner (user eren) can unlink files in /tmp on macOS.
+The driver kept reading the stale PID file every 2 seconds and logging warnings.
+
+**Fix:**
+  (a) If unlink() fails (EPERM), fall back to truncating the file to 0 bytes
+      via open(O_WRONLY|O_TRUNC). Next tick reads empty file → returns early.
+  (b) Once app is known dead (appWasPreviouslyAlive_ = false), suppress the
+      per-tick kill() warning. Only log on state transitions (alive→dead).
+  (c) Periodic tick logs (every 60s) still confirm the timer is running.
+
+**Result:** Clean logs after app death — no spam. ✅
+
+### Fix 20 — Software Volume Feels Wrong / Max Volume Lower Than Hardware (MODERATE — RESOLVED)
+
+**Symptom:**
+When ViPER was active, the volume slider felt "dead" in the upper range
+(80-100% barely changed), and maximum volume with ViPER was noticeably
+quieter than maximum volume without ViPER, even at 100%.
+
+**Root Cause (two issues):**
+
+1. **Linear gain curve vs logarithmic hardware:**
+   The software gain was applied linearly (vol × sample), but hardware volume
+   controls use a logarithmic/perceptual curve in the DAC/amplifier. With
+   linear gain, the perceptual difference between 80% and 100% is barely
+   audible, while 0-30% covers most of the perceived loudness range.
+
+2. **Real device volume drifting below 100%:**
+   On startup, the app sets the real output device to 100% and uses software
+   gain for volume control. But the real device volume could drift back below
+   100% due to macOS system events, Bluetooth reconnections, or other apps
+   adjusting it — permanently capping the effective output ceiling.
+
+**Fix:**
+  (a) Replaced linear gain with squared curve in IOProc callback:
+      `let gain = linearGain * linearGain`
+      This approximates perceptual loudness: 50% slider → 25% power → ~50%
+      perceived volume. Matches how hardware volume controls feel.
+
+  (b) Added real-device enforcement in syncVolumeToOutput():
+      Every time the virtual device volume changes, the real output device
+      is re-pushed to 100% via setRealDeviceToMax(). This prevents the
+      effective ceiling from dropping if something changes the real device
+      volume behind our back.
+
+**Result:**
+  - Volume slider feels natural and responsive across full range ✅
+  - Maximum volume with ViPER matches maximum volume without ViPER ✅
+  - Real device stays pinned at 100% while ViPER is active ✅
+
+---
+
+## Current Architecture
+
+```
+coreaudiod (root)
+  └── dlopen → ViPER4Mac.driver (bundle, x86_64) ✅
+        └── ViPER4Mac_Create()
+              └── aspl::Device "ViPER4Mac_VirtualDevice" @ 44100 Hz ✅
+                    ├── OnWriteMixedOutput → /tmp/viper4mac_ring.bin (0666, 131088 bytes)
+                    │     512 frames/callback @ ~86 Hz (stereo interleaved)
+                    └── Lifecycle monitor (dispatch_source, 2s polling)
+                          ├── Reads /tmp/viper4mac.pid
+                          ├── kill(pid, 0) → alive check
+                          └── App dead → SwitchAudioSource -n → restore real output
+
+ViPER4Mac.app (user eren)
+  └── AudioEngine.swift
+        ├── start() → writes PID to /tmp/viper4mac.pid ✅
+        ├── stop() → removes /tmp/viper4mac.pid ✅
+        ├── mapSharedMemory() → resets readPos=writePos on open ✅
+        ├── IOProc on virtual device (adaptive consumption)
+        │     → reads SHM ring (up to 512 frames/tick, skip if ring > 80% full)
+        │     → ViPER DSP processing
+        │     → software volume gain (squared curve for perceptual match)
+        │     → writeToRing (app-local ring, 8192 frames capacity)
+        ├── AUHAL output callback → readFromRing → real speakers ✅
+        ├── Volume listener → caches vol/mute + enforces real device at 100% ✅
+        └── PLL drift correction (±1 frame per 100 callbacks) ✅
+```
+
+---
+
+## Current Status
+
+Audio flows end-to-end. DSP effects apply. Volume control works naturally.
+App force-kill is handled automatically by the driver lifecycle monitor.
+No known critical issues remaining.
+
+---
+
+## Remaining Issues ❌
+
+### Issue 1 — SHM Ring Slowly Fills During Playback (LOW PRIORITY)
+
+**Symptom:**
+shmUsed slowly grows from ~20000 to ~25000 over 20+ minutes of playback,
+indicating the driver writes slightly faster than the app consumes.
+The PLL corrects for ring-level drift but doesn't fully counteract the
+SHM-level accumulation.
+
+**Evidence from logs:**
+  - shmUsed: 20430 → 20380 → 20330 → 25580 (over ~25 minutes)
+  - ringPct stays healthy at 72-79%
+  - No audible artifacts yet, but could eventually trigger SHM overflow
+
+**Proposed fix:**
+The PLL currently only monitors the Swift ring level, not the SHM level.
+Adding SHM-level awareness to the PLL would prevent long-term accumulation.
+When shmUsed > 24000, consume an extra frame per tick from SHM to drain it.
+
+### Issue 2 — PID File Permissions (COSMETIC)
+
+**Symptom:**
+Driver (running as root/_coreaudiod) cannot unlink /tmp/viper4mac.pid because
+the file is owned by user eren and /tmp has the sticky bit. Falls back to
+truncation which works but logs a warning.
+
+**Proposed fix:**
+Move PID file to /Library/Logs/ViPER4Mac/app.pid (owned by root, writable by
+the driver). Or have the app write to a location writable by both.
+
+---
+
+## Key Files
+
+| File | Role |
+|------|------|
+| ViPERDriver/ViPERDriver.cpp | C++ HAL plugin, runs as _coreaudiod. Includes lifecycle monitor. |
+| ViPERDriver/ViPERSharedRing.h | Shared memory struct (C/C++/Swift compatible) |
+| ViPER4Mac/Audio/AudioEngine.swift | Swift audio engine, IOProc + AUHAL + PID file |
+| ViPER4Mac/App/AppDelegate.swift | App lifecycle, status bar, calls AudioEngine start/stop |
+| ViPER4Mac/App/ViPER4MacApp.swift | SwiftUI app entry point |
+| ViPER4Mac/Bridge/ViPER4Mac-Bridging-Header.h | Exposes C headers to Swift |
+| ViPER4Mac/Model/ViPERState.swift | DSP parameter state |
+| ViPER4Mac/Info.plist | App plist — must include NSMicrophoneUsageDescription |
+| Vendor/libASPL/ | Apple HAL plugin wrapper library |
+
+---
+
+## Dependencies
+
+| Dependency | Required? | Purpose |
+|-----------|-----------|---------|
+| switchaudio-osx | Recommended | Auto-switch output when app dies. `brew install switchaudio-osx` |
+| Xcode | Required | Build toolchain |
+| libASPL (vendored) | Required | HAL plugin wrapper |
+| TPCircularBuffer (vendored) | Required | Lock-free ring buffer in driver |
+
+---
+
+## Build & Install Pipeline
+
+```bash
+make clean && make build && make install
+
+# Install steps:
+sudo rm -rf /Library/Audio/Plug-Ins/HAL/ViPER4Mac.driver
+sudo cp -R build/Release/ViPER4Mac.driver /Library/Audio/Plug-Ins/HAL/
+sudo chown -R root:wheel /Library/Audio/Plug-Ins/HAL/ViPER4Mac.driver
+sudo codesign -f -s - --deep /Library/Audio/Plug-Ins/HAL/ViPER4Mac.driver
+sudo killall coreaudiod
+```
+
+---
+
+## Useful Diagnostic Commands
+
+```bash
+# Driver log (C++ side, runs as _coreaudiod):
+cat /Library/Logs/ViPER4Mac/driver.log
+
+# App log (Swift side, runs as user):
+tail -f ~/Library/Logs/ViPER4Mac/viper.log
+
+# Live coreaudiod stream:
+sudo log stream --predicate 'process == "coreaudiod"' --debug | grep -i viper
+
+# Check SHM file:
+ls -la /tmp/viper4mac_ring.bin
+# Should be: -rw-rw-rw- _coreaudiod wheel 131088
+
+# Check PID file:
+cat /tmp/viper4mac.pid
+# Should contain the PID of the running ViPER4Mac.app
+
+# Check real output device sample rate:
+system_profiler SPAudioDataType | grep -A 5 "Built-in Output"
+
+# Watch ring buffer health live (run while audio plays):
+tail -f ~/Library/Logs/ViPER4Mac/viper.log | grep -E "IOPROC|OUTPUT"
+# Healthy: ringPct=50-65%, shmAvail=500-15000, shmCatchUp=false
+# Unhealthy: ringPct>80% or <10%, shmAvail>27000, shmCatchUp=true repeatedly
+
+# Watch lifecycle monitor:
+tail -f /Library/Logs/ViPER4Mac/driver.log | grep Lifecycle
+```
+
+---
+
+## Key Metrics (Healthy Steady State)
+
+| Metric | Healthy Range | Meaning |
+|--------|--------------|---------|
+| shmUsed (driver) | 500–5000 | SHM ring not backing up |
+| shmAvail (IOProc) | 500–16000 | Sufficient but not overflowing |
+| ringPct | 40–70% | Ring buffer has healthy headroom |
+| shmCatchUp | false | Not in backlog recovery |
+| WriteMixed max | > 0.001 | Real audio is flowing (not silence) |
+| IOPROC max | > 0.001 | Audio reaching Swift side |
+| OUTPUT max | > 0.001 | Audio reaching speakers |
+| Lifecycle Tick | Every ~60s | Confirms driver monitor is running |
+| PLL accumulated | < 100 | Clock drift correction stable |

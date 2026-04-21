@@ -1,3 +1,5 @@
+//ViPER4Mac/Audio/AudioEngine.swift
+
 import AudioToolbox
 import CoreAudio
 import Foundation
@@ -33,21 +35,35 @@ final class AudioEngine {
     var onOutputDeviceChanged: (() -> Void)?
 
     var processingEnabled = true {
-        didSet {
-            guard isRunning, processingEnabled != oldValue else { return }
-            if processingEnabled {
-                settingDevice = true
-                setDefaultOutputDevice(inputDeviceID)
-                setDefaultSystemOutputDevice(inputDeviceID)
-                settingDevice = false
-            } else {
-                settingDevice = true
-                setDefaultOutputDevice(outputDeviceID)
-                setDefaultSystemOutputDevice(outputDeviceID)
-                settingDevice = false
-            }
+    didSet {
+        guard isRunning, processingEnabled != oldValue else { return }
+        if processingEnabled {
+            // 1. Sync the virtual slider to match the real device's current volume
+            //    This prevents a sudden volume jump when we take over.
+            syncVolumeFromRealDevice()
+
+            // 2. Force the real device to 100% (Max).
+            //    This removes the hardware cap so the ViPER slider has full range.
+            //    Now: Total Volume = (ViPER Slider %) * 100%
+            setRealDeviceToMax()
+
+            // 3. Switch default
+            settingDevice = true
+            setDefaultOutputDevice(inputDeviceID)
+            setDefaultSystemOutputDevice(inputDeviceID)
+            settingDevice = false
+        } else {
+            // Disabling ViPER
+            // Push the software volume to the real device so the volume stays consistent
+            pushVolumeToRealDevice()
+
+            settingDevice = true
+            setDefaultOutputDevice(outputDeviceID)
+            setDefaultSystemOutputDevice(outputDeviceID)
+            settingDevice = false
         }
     }
+}
 
     fileprivate var inputCallbackCount: UInt64 = 0
     fileprivate var outputCallbackCount: UInt64 = 0
@@ -148,6 +164,9 @@ fileprivate var pllCallbacksSinceLastCorrection: Int = 0
             logger.info("AudioEngine.start() bailed: already running")
             return
         }
+        let pidString = "\(ProcessInfo.processInfo.processIdentifier)"
+        try? pidString.write(toFile: "/tmp/viper4mac.pid", atomically: true, encoding: .utf8)
+        logger.info("Wrote PID file: \(pidString)")
 
         guard let viperDevice = findViPERDevice() else {
             logger.error("Virtual device not found. Is the driver installed?")
@@ -252,6 +271,8 @@ fileprivate var pllCallbacksSinceLastCorrection: Int = 0
 
     func stop() {
         guard isRunning else { return }
+        try? FileManager.default.removeItem(atPath: "/tmp/viper4mac.pid")
+        logger.info("Removed PID file")
 
         removeDeviceListListener()
         removeVolumeListeners()
@@ -705,6 +726,106 @@ fileprivate func setupAudioConverter(inputRate: Float64, outputRate: Float64) {
         volumeListenerInstalled = false
     }
 
+private func setRealDeviceVolume(_ vol: Float32) {
+    guard outputDeviceID != kAudioObjectUnknown else { return }
+
+    let scopes: [AudioObjectPropertyScope] = [kAudioObjectPropertyScopeOutput]
+    let elements: [AudioObjectPropertyElement] = [
+        kAudioObjectPropertyElementMain, 1, 2
+    ]
+
+    for scope in scopes {
+        for element in elements {
+            var volAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyVolumeScalar,
+                mScope: scope,
+                mElement: element
+            )
+
+            if AudioObjectHasProperty(outputDeviceID, &volAddr) {
+                var isSettable: DarwinBoolean = false
+                AudioObjectIsPropertySettable(outputDeviceID, &volAddr, &isSettable)
+                guard isSettable.boolValue else { continue }
+
+                var volCopy = vol  // ✅ mutable local copy for inout
+                AudioObjectSetPropertyData(
+                    outputDeviceID, &volAddr, 0, nil,
+                    UInt32(MemoryLayout<Float32>.size), &volCopy
+                )
+            }
+        }
+    }
+}
+
+private func setRealDeviceToMax() {
+    setRealDeviceVolume(1.0)
+}
+
+private func syncVolumeFromRealDevice() {
+    guard outputDeviceID != kAudioObjectUnknown else { return }
+
+    let scopes: [AudioObjectPropertyScope] = [kAudioObjectPropertyScopeOutput]
+    let elements: [AudioObjectPropertyElement] = [
+        kAudioObjectPropertyElementMain, 1, 2
+    ]
+
+    for scope in scopes {
+        for element in elements {
+            var volAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyVolumeScalar,
+                mScope: scope,
+                mElement: element
+            )
+
+            if AudioObjectHasProperty(outputDeviceID, &volAddr) {
+                var vol: Float32 = 1.0          // must be var
+                var size = UInt32(MemoryLayout<Float32>.size)   // must be var
+                let status = AudioObjectGetPropertyData(
+                    outputDeviceID, &volAddr, 0, nil, &size, &vol
+                )
+                if status == noErr {
+                    os_unfair_lock_lock(&volumeLock)
+                    currentVolume = vol
+                    os_unfair_lock_unlock(&volumeLock)
+                    return
+                }
+            }
+        }
+    }
+}
+
+private func pushVolumeToRealDevice() {
+    guard outputDeviceID != kAudioObjectUnknown else { return }
+
+    os_unfair_lock_lock(&volumeLock)
+    let vol = currentVolume
+    os_unfair_lock_unlock(&volumeLock)
+
+    setRealDeviceVolume(vol)
+
+    // Handle mute state as well
+    os_unfair_lock_lock(&volumeLock)
+    let muted = currentlyMuted
+    os_unfair_lock_unlock(&volumeLock)
+
+    var muteAddr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyMute,
+        mScope: kAudioObjectPropertyScopeOutput,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    if AudioObjectHasProperty(outputDeviceID, &muteAddr) {
+        var isSettable: DarwinBoolean = false
+        AudioObjectIsPropertySettable(outputDeviceID, &muteAddr, &isSettable)
+        if isSettable.boolValue {
+            var muteVal: UInt32 = muted ? 1 : 0
+            AudioObjectSetPropertyData(
+                outputDeviceID, &muteAddr, 0, nil,
+                UInt32(MemoryLayout<UInt32>.size), &muteVal
+            )
+        }
+    }
+}
+
     func syncVolumeToOutput() {
         guard inputDeviceID != kAudioObjectUnknown else { return }
 
@@ -732,7 +853,13 @@ fileprivate func setupAudioConverter(inputRate: Float64, outputRate: Float64) {
         os_unfair_lock_unlock(&volumeLock)
 
         logger.info("Volume cached: vol=\(volume) muted=\(muted)")
+
+        // Enforce real device at max while processing is active
+        if processingEnabled {
+            setRealDeviceToMax()
+        }
     }
+
 
     private func removeDeviceListListener() {
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
@@ -964,11 +1091,12 @@ fileprivate func writeToRingWithASRC(_ data: UnsafePointer<Float>, frameCount: I
     }
     
     // Prepare input buffer list (interleaved)
-    var inputBuffer = AudioBuffer(
-        mNumberChannels: channelCount,
-        mDataByteSize: UInt32(frameCount * Int(channelCount) * 4),
-        mData: UnsafeMutableRawPointer(mutating: data)
+    let inputBuffer = AudioBuffer(
+    mNumberChannels: channelCount,
+    mDataByteSize: UInt32(frameCount * Int(channelCount) * 4),
+    mData: UnsafeMutableRawPointer(mutating: data)
     )
+
     var inputBufferList = AudioBufferList(
         mNumberBuffers: 1,
         mBuffers: inputBuffer
@@ -1423,12 +1551,19 @@ private let inputIOProcCallback: AudioDeviceIOProc = {
     let muted = engine.currentlyMuted
     os_unfair_lock_unlock(&engine.volumeLock)
 
-    let gain: Float = muted ? 0.0 : vol
+    // Use squared curve to approximate perceptual (logarithmic) volume.
+    // Hardware volume controls use log curves in the DAC/amplifier.
+    // Linear gain (vol * sample) makes the slider feel dead in the upper range
+    // because perceived loudness is logarithmic, not linear.
+    // vol² gives a good approximation: 50% slider → 25% power → ~50% perceived.
+    let linearGain: Float = muted ? 0.0 : vol
+    let gain: Float = linearGain * linearGain  // squared curve
     if gain < 0.9999 {
         for i in 0 ..< samplesToRead {
             tempBuf[i] *= gain
         }
     }
+
 
     // ── Write to ring ─────────────────────────────────────────────────────────
     if engine.isConverterActive {
